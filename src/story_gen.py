@@ -1,5 +1,10 @@
+import os
 import ollama
 from .utils import setup_logging, split_text
+
+# Initialize client with host from env (defaults to localhost:11434)
+ollama_host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+client = ollama.Client(host=ollama_host)
 
 logger = setup_logging("StoryGen")
 
@@ -7,7 +12,7 @@ def check_and_pull_model(model_name):
     """Checks if the model exists locally, and pulls it if not."""
     try:
         # List available models
-        response = ollama.list()
+        response = client.list()
         
         installed_models = []
         # Handle object-based response (newer ollama client)
@@ -31,7 +36,7 @@ def check_and_pull_model(model_name):
         
         if not is_installed:
             logger.info(f"Model '{model_name}' not found locally. Pulling it now (this may take a while)...")
-            ollama.pull(model_name)
+            client.pull(model_name)
             logger.info(f"Model '{model_name}' pulled successfully.")
         else:
             logger.info(f"Model '{model_name}' is ready.")
@@ -56,7 +61,7 @@ def generate_story(character_name, model="llama3"):
     """
 
     try:
-        response = ollama.chat(model=model, messages=[
+        response = client.chat(model=model, messages=[
             {
                 'role': 'user',
                 'content': prompt,
@@ -114,7 +119,7 @@ def generate_image_prompts(segments, character_name, model="llama3"):
         """
         
         try:
-            response = ollama.chat(model=model, messages=[{'role': 'user', 'content': prompt_request}])
+            response = client.chat(model=model, messages=[{'role': 'user', 'content': prompt_request}])
             image_prompt = response['message']['content'].strip()
             # Clean up if the model is chatty
             if "Prompt:" in image_prompt:

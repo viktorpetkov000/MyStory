@@ -16,6 +16,5 @@ pydub
 ffmpeg-python
 soundfile
 librosa
-nltk
 beautifulsoup4
 requests

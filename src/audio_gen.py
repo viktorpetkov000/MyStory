@@ -4,6 +4,11 @@ import time
 import numpy as np
 import torchaudio
 import soundfile as sf
+import huggingface_hub
+# Patch for Coqui TTS compatibility with huggingface_hub >= 0.25.0
+if not hasattr(huggingface_hub, 'cached_download'):
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+
 from TTS.api import TTS
 from .utils import setup_logging, ensure_dir, split_text
 
@@ -139,15 +144,9 @@ def generate_narration(text, reference_audio_path, output_path, language="en"):
         # Compute latents
         logger.info("Computing speaker latents...")
         start_latents = time.time()
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
             
         with torch.no_grad():
             gpt_cond_latent, speaker_embedding = tts.synthesizer.tts_model.get_conditioning_latents(audio_path=reference_audio_path)
-            
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
             
         logger.info(f"Latents computed in {time.time() - start_latents:.2f}s")
         
@@ -158,8 +157,6 @@ def generate_narration(text, reference_audio_path, output_path, language="en"):
                 
             logger.info(f"Generating sentence {i+1}/{len(sentences)}...")
             
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             start_inf = time.time()
             
             with torch.no_grad():
@@ -169,9 +166,6 @@ def generate_narration(text, reference_audio_path, output_path, language="en"):
                     gpt_cond_latent=gpt_cond_latent,
                     speaker_embedding=speaker_embedding
                 )
-                
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             
             logger.info(f"Inference took {time.time() - start_inf:.2f}s")
 

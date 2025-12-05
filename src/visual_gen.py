@@ -5,6 +5,11 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if "HF_HOME" not in os.environ:
     os.environ["HF_HOME"] = os.path.join(project_root, "models", "huggingface")
 
+import huggingface_hub
+# Patch for cached_download compatibility
+if not hasattr(huggingface_hub, 'cached_download'):
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+
 from diffusers import AutoPipelineForText2Image
 try:
     from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
