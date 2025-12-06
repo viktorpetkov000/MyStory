@@ -1,10 +1,50 @@
 import os
 import yt_dlp
+import numpy as np
+import scipy.io.wavfile as wav
+import noisereduce as nr
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from .utils import setup_logging, ensure_dir, get_ffmpeg_path
 
 logger = setup_logging("DataScouring")
+
+def clean_audio(audio_path):
+    """
+    Removes background noise from the audio file using spectral gating.
+    Overwrites the input file or returns path to cleaned version.
+    """
+    logger.info(f"Cleaning background noise from: {audio_path}")
+    try:
+        # Load audio using scipy (faster for arrays)
+        rate, data = wav.read(audio_path)
+        
+        # Check shape: scipy returns (samples, channels) but noisereduce wants (channels, samples)
+        if len(data.shape) > 1:
+            data = data.T
+        
+        # Perform noise reduction
+        reduced_noise = nr.reduce_noise(
+            y=data, 
+            sr=rate, 
+            stationary=True,
+            chunk_size=600000 # Use safer chunk size (~13s)
+        )
+        
+        # Transpose back to (samples, channels) for writing
+        if len(reduced_noise.shape) > 1:
+            reduced_noise = reduced_noise.T
+        
+        # Save back
+        cleaned_path = audio_path.replace(".wav", "_clean.wav")
+        wav.write(cleaned_path, rate, reduced_noise)
+        
+        logger.info(f"Cleaned audio saved to: {cleaned_path}")
+        return cleaned_path
+    
+    except Exception as e:
+        logger.error(f"Failed to clean audio: {e}")
+        return audio_path # Return original if failure
 
 def download_audio(youtube_url, output_dir):
     """
@@ -46,11 +86,19 @@ def download_audio(youtube_url, output_dir):
         logger.error(f"Failed to download audio: {e}")
         return None
 
-def segment_audio(audio_path, output_dir, min_silence_len=500, silence_thresh=-40, keep_silence=200):
+def segment_audio(audio_path, output_dir, min_silence_len=500, silence_thresh=-40, keep_silence=200, remove_noise=False):
     """
     Splits audio file into segments based on silence.
+    Optional: remove_noise (bool) to clean audio before splitting.
     """
     ensure_dir(output_dir)
+    
+    if remove_noise:
+        # clear audio before loading into pydub
+        cleaned_path = clean_audio(audio_path)
+        if cleaned_path != audio_path:
+            audio_path = cleaned_path
+            
     logger.info(f"Segmenting audio: {audio_path}")
     
     try:

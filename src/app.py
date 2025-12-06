@@ -4,6 +4,7 @@ import sys
 import time
 import shutil
 import multiprocessing
+import queue
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -11,8 +12,8 @@ sys.path.append(project_root)
 
 # Set environment variables
 os.environ["OLLAMA_MODELS"] = os.path.join(project_root, "models", "ollama")
-os.environ["OLLAMA_HOST"] = "127.0.0.1:11435" # Use custom port to avoid conflicts
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1" # suppress windows symlink warning
+os.environ["OLLAMA_HOST"] = "127.0.0.1:11435" # Custom port
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HOME"] = os.path.join(project_root, "models", "huggingface")
 os.environ["TTS_HOME"] = os.path.join(project_root, "models", "tts")
 
@@ -31,62 +32,177 @@ if ffmpeg_path:
 
 logger = setup_logging("App")
 
-# --- Multiprocessing Workers ---
+# --- Persistent Workers ---
 
-def _run_audio_generation(text, ref_audio, audio_path, result_queue):
-    """Run TTS in a separate process to isolate CUDA context."""
+def audio_worker(task_queue, result_queue):
+    """
+    Persistent worker for Audio Generation.
+    Loads model ONCE, then waits for tasks.
+    """
+    print("[AudioWorker] Starting process...")
     try:
         from src.audio_gen import generate_narration
-        result = generate_narration(text, ref_audio, audio_path)
-        result_queue.put(("success", result))
+        print("[AudioWorker] Ready for tasks.")
+        
+        while True:
+            try:
+                task = task_queue.get(timeout=1)
+                if task == "STOP":
+                    break
+                
+                # Unwrap task
+                text, ref_audio, audio_path, temp, rep_pen, top_k, top_p = task
+                print(f"[AudioWorker] Processing: {text[:20]}... params: T={temp}, RP={rep_pen}")
+                
+                res = generate_narration(
+                    text, ref_audio, audio_path, 
+                    temperature=float(temp), 
+                    repetition_penalty=float(rep_pen), 
+                    top_k=int(top_k), 
+                    top_p=float(top_p)
+                )
+                result_queue.put(("success", res))
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[AudioWorker] Error: {e}")
+                result_queue.put(("error", str(e)))
+                
     except Exception as e:
-        result_queue.put(("error", str(e)))
+        print(f"[AudioWorker] Critical Fail: {e}")
+        # Signal death
+        result_queue.put(("CRITICAL", str(e)))
 
-def _run_visual_generation(text, audio_path, output_dir, result_queue):
-    """Run Visuals + Video Assembly in a separate process."""
+def visual_worker(task_queue, result_queue):
+    """
+    Persistent worker for Visual Generation.
+    Loads SDXL model ONCE, then waits for tasks.
+    """
+    print("[VisualWorker] Starting process...")
     try:
         from src.story_gen import split_story_into_segments, generate_image_prompts
-        from src.visual_gen import generate_image, create_video
+        from src.visual_gen import generate_image, create_video, load_pipeline
         
-        # 1. Prompts
-        segments = split_story_into_segments(text)
-        prompts = generate_image_prompts(segments, "cinematic scene")
+        # Preload Model
+        print("[VisualWorker] Loading SDXL Model...")
+        pipe = load_pipeline() # This caches the pipe in visual_gen's global _pipe
+        print("[VisualWorker] Model Loaded. Ready.")
         
-        # 2. Images
-        temp_dir = os.path.join(output_dir, "temp_images")
-        ensure_dir(temp_dir)
-        
-        image_paths = []
-        for i, prompt in enumerate(prompts):
-            img_path = os.path.join(temp_dir, f"img_{i}.png")
-            saved = generate_image(prompt, img_path)
-            if saved:
-                image_paths.append(saved)
-        
-        if not image_paths:
-            result_queue.put(("error", "No images generated"))
-            return
+        while True:
+            try:
+                task = task_queue.get(timeout=1)
+                if task == "STOP":
+                    break
+                
+                # Unwrap task
+                text, audio_path, output_dir = task
+                print("[VisualWorker] Generating Visuals...")
+                
+                # 1. Prompts
+                segments = split_story_into_segments(text)
+                prompts = generate_image_prompts(segments, "cinematic scene")
+                
+                # 2. Images
+                temp_dir = os.path.join(output_dir, "temp_images")
+                ensure_dir(temp_dir)
+                
+                image_paths = []
+                for i, prompt in enumerate(prompts):
+                    img_path = os.path.join(temp_dir, f"img_{i}.png")
+                    saved = generate_image(prompt, img_path)
+                    if saved:
+                        image_paths.append(saved)
+                
+                if not image_paths:
+                    result_queue.put(("error", "No images generated"))
+                    continue
 
-        # 3. Video
-        final_video_path = os.path.join(output_dir, "final_story.mp4")
-        video_path = create_video(audio_path, image_paths, final_video_path)
-        
-        if video_path:
-             result_queue.put(("success", video_path))
-        else:
-             result_queue.put(("error", "Video assembly failed"))
+                # 3. Video
+                final_video_path = os.path.join(output_dir, "final_story.mp4")
+                video_path = create_video(audio_path, image_paths, final_video_path)
+                
+                if video_path:
+                     result_queue.put(("success", video_path))
+                else:
+                     result_queue.put(("error", "Video assembly failed"))
             
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[VisualWorker] Error: {e}")
+                result_queue.put(("error", str(e)))
+
     except Exception as e:
-        result_queue.put(("error", str(e)))
+        print(f"[VisualWorker] Critical Fail: {e}")
+        result_queue.put(("CRITICAL", str(e)))
 
-# --- Main Processing Logic ---
+def scraper_worker(task_queue, result_queue):
+    """
+    Persistent worker for Voice Scraping.
+    Downloads and segments audio in a background process.
+    """
+    print("[ScraperWorker] Starting process...")
+    try:
+        from src.data_scouring import download_audio, segment_audio
+        print("[ScraperWorker] Ready for tasks.")
+        
+        while True:
+            try:
+                task = task_queue.get(timeout=1)
+                if task == "STOP":
+                    break
+                
+                # Unwrap task
+                url, char_name, silence_thresh, min_silence_len, remove_noise = task
+                print(f"[ScraperWorker] Processing: {char_name} ({url})")
+                
+                temp_dir = os.path.join("temp", "scraper", char_name)
+                output_dir = os.path.join("output", "voices", char_name)
+                clean_temp(temp_dir)
+                ensure_dir(output_dir)
+                
+                wav_path = download_audio(url, temp_dir)
+                if not wav_path:
+                    result_queue.put(("error", "Download failed"))
+                    continue
+                    
+                segments = segment_audio(
+                    wav_path, 
+                    output_dir, 
+                    min_silence_len=int(min_silence_len), 
+                    silence_thresh=int(silence_thresh),
+                    remove_noise=remove_noise
+                )
+                
+                result_queue.put(("success", f"Success! Saved {len(segments)} segments to {output_dir}"))
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[ScraperWorker] Error: {e}")
+                result_queue.put(("error", str(e)))
 
-def process_story(text, ref_audio, progress=gr.Progress()):
+    except Exception as e:
+        print(f"[ScraperWorker] Critical Fail: {e}")
+        result_queue.put(("CRITICAL", str(e)))
+
+
+# --- Global State ---
+g_audio_task = None
+g_audio_result = None
+g_visual_task = None
+g_visual_result = None
+g_scraper_task = None
+g_scraper_result = None
+
+# --- Main Logic ---
+
+def process_story(text, ref_audio, skip_visuals, temp, rep_pen, top_k, top_p, progress=gr.Progress()):
     if not text or not ref_audio:
-        return "Error: Please provide both text and reference audio.", None
+        return "Error: Input missing", None
 
-    logger.info("Starting processing...")
-    progress(0, desc="Initializing...")
+    progress(0, desc="Queuing Task...")
     
     run_id = f"run_{int(time.time())}"
     temp_dir = os.path.join("temp", run_id)
@@ -94,87 +210,85 @@ def process_story(text, ref_audio, progress=gr.Progress()):
     clean_temp(temp_dir)
     ensure_dir(output_dir)
 
-    # 1. Generate Audio
-    logger.info("Generating audio (in subprocess)...")
-    progress(0.1, desc="Generating Audio...")
+    # 1. Audio
     audio_path = os.path.join(temp_dir, "narration.wav")
     
-    queue_audio = multiprocessing.Queue()
-    p_audio = multiprocessing.Process(
-        target=_run_audio_generation,
-        args=(text, ref_audio, audio_path, queue_audio)
-    )
-    p_audio.start()
+    # Send task
+    progress(0.1, desc="Generating Audio...")
+    g_audio_task.put((text, ref_audio, audio_path, temp, rep_pen, top_k, top_p))
     
-    # Wait for completion while keeping UI responsive (Gradio yields)
-    while p_audio.is_alive():
-        time.sleep(0.5)
-        # progress(0.2, desc="Generating Audio (Running)...") 
-    
-    p_audio.join() # Ensure cleanup
-    
-    if not queue_audio.empty():
-        status, result = queue_audio.get()
-        if status == "error":
-            return f"Error: Audio generation failed - {result}", None
+    # Wait for result
+    try:
+        status, result = g_audio_result.get(timeout=300) # 5 min timeout
+        if status != "success":
+            return f"Audio Error: {result}", None
         generated_audio = result
-    else:
-        return "Error: Audio process died unexpectedly.", None
+    except queue.Empty:
+        return "Error: Audio Worker Timed Out", None
 
-    if not generated_audio:
-        return "Error: Audio generation returned None.", None
+    if skip_visuals:
+        # Copy audio to output to make it accessible
+        final_audio_path = os.path.join(output_dir, "narrated_story.wav")
+        shutil.copy(generated_audio, final_audio_path)
+        progress(1.0, desc="Done (Audio Only)")
+        return "Success! Audio generated.", final_audio_path
 
-    # 2. Visuals & Video
-    logger.info("Generating visuals & video (in subprocess)...")
-    progress(0.4, desc="Generating Visuals & Video...")
+    # 2. Visuals
+    progress(0.4, desc="Generating Video...")
+    g_visual_task.put((text, generated_audio, output_dir))
     
-    queue_video = multiprocessing.Queue()
-    p_video = multiprocessing.Process(
-        target=_run_visual_generation,
-        args=(text, generated_audio, output_dir, queue_video)
-    )
-    p_video.start()
-    
-    while p_video.is_alive():
-        time.sleep(0.5)
-        # progress(0.6, desc="Working on Visuals...")
-        
-    p_video.join()
-
-    if not queue_video.empty():
-        status, result = queue_video.get()
-        if status == "error":
-            return f"Error: Video generation failed - {result}", None
+    try:
+        status, result = g_visual_result.get(timeout=600) # 10 min timeout
+        if status != "success":
+            return f"Visual Error: {result}", None
         video_path = result
-    else:
-        return "Error: Video process died unexpectedly.", None
+    except queue.Empty:
+        return "Error: Visual Worker Timed Out", None
     
     progress(1.0, desc="Done!")
     return "Success! Video generated.", video_path
 
-def process_scraper(url, char_name):
+def process_scraper(url, char_name, silence_thresh, min_silence_len, remove_noise, progress=gr.Progress()):
     if not url or not char_name:
-        return "Error: Please provide both URL and Character Name."
+        return "Error: Missing URL or Name"
     
-    # Simple synchronous call is fine here as it's mostly network/CPU IO
-    from src.data_scouring import download_audio, segment_audio
+    progress(0, desc="Queuing Scraper Task...")
+    g_scraper_task.put((url, char_name, silence_thresh, min_silence_len, remove_noise))
     
+    progress(0.1, desc="Processing (Download/Clean/Segment)...")
     try:
-        temp_dir = os.path.join("temp", "scraper", char_name)
-        output_dir = os.path.join("output", "voices", char_name)
-        clean_temp(temp_dir)
-        ensure_dir(output_dir)
-        
-        wav_path = download_audio(url, temp_dir)
-        if not wav_path:
-            return "Error: Download failed."
-            
-        segments = segment_audio(wav_path, output_dir)
-        return f"Success! Saved {len(segments)} segments to {output_dir}"
-    except Exception as e:
-        return f"Error: {e}"
+        # Give it plenty of time (download + noise removal can be slow)
+        status, result = g_scraper_result.get(timeout=1200) # 20 min timeout
+        if status != "success":
+            return f"Error: {result}"
+        return result
+    except queue.Empty:
+        return "Error: Scraper Worker Timed Out"
 
 # --- UI Setup ---
+
+# Initialize Queues
+g_audio_task = multiprocessing.Queue()
+g_audio_result = multiprocessing.Queue()
+g_visual_task = multiprocessing.Queue()
+g_visual_result = multiprocessing.Queue()
+g_scraper_task = multiprocessing.Queue()
+g_scraper_result = multiprocessing.Queue()
+
+def start_workers():
+    p_audio = multiprocessing.Process(target=audio_worker, args=(g_audio_task, g_audio_result))
+    p_visual = multiprocessing.Process(target=visual_worker, args=(g_visual_task, g_visual_result))
+    p_scraper = multiprocessing.Process(target=scraper_worker, args=(g_scraper_task, g_scraper_result))
+    
+    p_audio.daemon = True
+    p_visual.daemon = True
+    p_scraper.daemon = True
+    
+    p_audio.start()
+    p_visual.start()
+    p_scraper.start()
+    
+    return p_audio, p_visual, p_scraper
 
 with gr.Blocks(title="MyStory AI") as demo:
     gr.Markdown("# 🎬 MyStory AI")
@@ -183,40 +297,79 @@ with gr.Blocks(title="MyStory AI") as demo:
         with gr.Tab("Story Mode"):
             with gr.Row():
                 with gr.Column():
-                    story_input = gr.Textbox(label="Story Text", lines=5, placeholder="Enter the story text here...")
+                    story_input = gr.Textbox(label="Story Text", lines=5, placeholder="Enter text...")
                     audio_input = gr.Audio(label="Reference Voice", type="filepath")
-                    generate_btn = gr.Button("Generate Video", variant="primary")
+                    
+                    with gr.Accordion("Advanced Voice Settings", open=False):
+                        temp_slider = gr.Slider(minimum=0.01, maximum=1.0, value=0.75, label="Temperature", info="Lower = More stable/similar to ref. Higher = More expressive/random.")
+                        rep_pen_slider = gr.Slider(minimum=1.0, maximum=10.0, value=2.0, label="Repetition Penalty", info="Increase if speech repeats or stutters.")
+                        top_p_slider = gr.Slider(minimum=0.01, maximum=1.0, value=0.85, label="Top P", info="Nucleus sampling probability.")
+                        top_k_slider = gr.Slider(minimum=1, maximum=100, step=1, value=50, label="Top K", info="Top-K sampling.")
+                        
+                    skip_vis = gr.Checkbox(label="Generate Audio Only (Skip Video)", value=False)
+                    generate_btn = gr.Button("Generate", variant="primary")
                 
                 with gr.Column():
                     status_output = gr.Textbox(label="Status")
-                    video_output = gr.Video(label="Result")
+                    # Use File output because it can show Video OR Audio players automatically
+                    final_output = gr.File(label="Result")
             
             generate_btn.click(
                 fn=process_story,
-                inputs=[story_input, audio_input],
-                outputs=[status_output, video_output]
+                inputs=[story_input, audio_input, skip_vis, temp_slider, rep_pen_slider, top_k_slider, top_p_slider],
+                outputs=[status_output, final_output]
             )
             
         with gr.Tab("Voice Scraper"):
+            gr.Markdown("## YouTube Audio Scraper")
             with gr.Row():
                 url_input = gr.Textbox(label="YouTube URL")
                 name_input = gr.Textbox(label="Character Name")
-                scrape_btn = gr.Button("Scrape & Segment")
             
+            with gr.Accordion("Advanced Tuning", open=True):
+                thresh_slider = gr.Slider(
+                    minimum=-60, maximum=-10, value=-40, step=1, 
+                    label="Silence Threshold (dB)", 
+                    info="Lower = Checks for quieter silence. Higher = Less sensitive."
+                )
+                min_len_slider = gr.Slider(
+                    minimum=100, maximum=3000, value=500, step=100, 
+                    label="Min Silence Length (ms)",
+                    info="Minimum duration of silence to trigger a split."
+                )
+                noise_checkbox = gr.Checkbox(
+                    label="Remove Background Noise",
+                    value=False,
+                    info="Cleans audio using spectral gating before splitting (may be slow)."
+                )
+            
+            scrape_btn = gr.Button("Scrape & Segment")
             scraper_status = gr.Textbox(label="Status")
             
             scrape_btn.click(
                 fn=process_scraper,
-                inputs=[url_input, name_input],
+                inputs=[url_input, name_input, thresh_slider, min_len_slider, noise_checkbox],
                 outputs=[scraper_status]
             )
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     
-    # Ensure Ollama is running
     if not start_ollama():
         logger.warning("Ollama failed to start!")
         
-    logger.info("Launching Gradio UI...")
-    demo.queue().launch(inbrowser=True)
+    # Start Persistent Workers
+    logger.info("Starting Background Workers...")
+    p_a, p_v, p_s = start_workers()
+    logger.info("Workers Started. UI Launching...")
+    
+    try:
+        demo.queue().launch(inbrowser=True)
+    finally:
+        # Cleanup on exit
+        g_audio_task.put("STOP")
+        g_visual_task.put("STOP")
+        g_scraper_task.put("STOP")
+        p_a.terminate()
+        p_v.terminate()
+        p_s.terminate()

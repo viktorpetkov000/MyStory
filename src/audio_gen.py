@@ -107,7 +107,7 @@ def load_tts_model():
         logger.error(traceback.format_exc())
         return None
 
-def generate_narration(text, reference_audio_path, output_path, language="en"):
+def generate_narration(text, reference_audio_path, output_path, language="en", temperature=0.75, repetition_penalty=2.0, top_k=50, top_p=0.85):
     """
     Generates audio narration using Coqui TTS (XTTS v2) with voice cloning.
     """
@@ -135,7 +135,7 @@ def generate_narration(text, reference_audio_path, output_path, language="en"):
             logger.error("TTS model failed to load.")
             return None
         
-        logger.info(f"Generating audio for text (length: {len(text)})...")
+        logger.info(f"Generating audio for text (length: {len(text)})... Params: T={temperature}, RP={repetition_penalty}, TK={top_k}, TP={top_p}")
         
         # Manual sentence splitting
         sentences = split_text(text)
@@ -164,7 +164,11 @@ def generate_narration(text, reference_audio_path, output_path, language="en"):
                     text=sentence,
                     language=language,
                     gpt_cond_latent=gpt_cond_latent,
-                    speaker_embedding=speaker_embedding
+                    speaker_embedding=speaker_embedding,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    top_k=top_k,
+                    top_p=top_p
                 )
             
             logger.info(f"Inference took {time.time() - start_inf:.2f}s")

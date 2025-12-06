@@ -18,3 +18,4 @@ soundfile
 librosa
 beautifulsoup4
 requests
+noisereduce
